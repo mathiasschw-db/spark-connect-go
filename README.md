@@ -30,12 +30,12 @@ make gen && make test
 
 Step 4: Setup the Spark Driver on localhost.
 
-1. [Download Spark distribution](https://spark.apache.org/downloads.html) (3.4.0+), unzip the package.
+1. [Download Spark distribution](https://spark.apache.org/downloads.html) (3.5.0+), unzip the package.
 
 2. Start the Spark Connect server with the following command (make sure to use a package version that matches your Spark distribution):
 
 ```
-sbin/start-connect-server.sh --packages org.apache.spark:spark-connect_2.12:3.4.0
+sbin/start-connect-server.sh --packages org.apache.spark:spark-connect_2.12:3.5.2
 ```
 
 Step 5: Run the example Go application.
@@ -50,37 +50,9 @@ See [Quick Start Guide](quick-start.md)
 
 ## High Level Design
 
-Following [diagram](https://textik.com/#ac299c8f32c4c342) shows main code in current prototype:
-
-```
-    +-------------------+                                                                              
-    |                   |                                                                              
-    |   dataFrameImpl   |                                                                              
-    |                   |                                                                              
-    +-------------------+                                                                              
-              |                                                                                        
-              |                                                                                        
-              +                                                                                        
-    +-------------------+                                                                              
-    |                   |                                                                              
-    | sparkSessionImpl  |                                                                              
-    |                   |                                                                              
-    +-------------------+                                                                              
-              |                                                                                        
-              |                                                                                        
-              +                                                                                        
-+---------------------------+               +----------------+                                         
-|                           |               |                |                                         
-| SparkConnectServiceClient |--------------+|  Spark Driver  |                                         
-|                           |               |                |                                         
-+---------------------------+               +----------------+
-```
-
-`SparkConnectServiceClient` is GRPC client which talks to Spark Driver. `sparkSessionImpl` generates `dataFrameImpl`
-instances. `dataFrameImpl` uses the GRPC client in `sparkSessionImpl` to communicate with Spark Driver.
-
-We will mimic the logic in Spark Connect Scala implementation, and adopt Go common practices, e.g. returning `error` object for
-error handling.
+The overall goal of the design is to find a good balance of principle of the least surprise for
+develoeprs that are familiar with the APIs of Apache Spark and idiomatic Go usage. The high-level
+structure of the packages follows roughly the PySpark giudance but with Go idioms.
 
 ## Contributing
 

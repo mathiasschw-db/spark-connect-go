@@ -22,7 +22,6 @@ import (
 	"testing"
 
 	"github.com/apache/spark-connect-go/v35/spark/client/channel"
-
 	"github.com/apache/spark-connect-go/v35/spark/sparkerrors"
 	"github.com/stretchr/testify/assert"
 )
@@ -38,10 +37,12 @@ func TestBasicChannelBuilder(t *testing.T) {
 
 func TestBasicChannelParsing(t *testing.T) {
 	_, err := channel.NewBuilder("abc://asdada:1333")
-	assert.False(t, strings.Contains(err.Error(), "scheme"), "Channel build should fail with wrong scheme")
+	assert.False(t, strings.Contains(err.Error(), "scheme"),
+		"Channel build should fail with wrong scheme")
 
 	_, err = channel.NewBuilder("sc://:1333")
-	assert.False(t, strings.Contains(err.Error(), "scheme"), "Should not have an error for a proper URL")
+	assert.False(t, strings.Contains(err.Error(), "scheme"),
+		"Should not have an error for a proper URL")
 
 	cb, err := channel.NewBuilder("sc://empty")
 	assert.Nilf(t, err, "Valid path should not fail: %v", err)
@@ -58,6 +59,7 @@ func TestBasicChannelParsing(t *testing.T) {
 	assert.ErrorIs(t, err, sparkerrors.InvalidInputError)
 
 	cb, err = channel.NewBuilder(goodChannelURL)
+	assert.Nilf(t, err, "Should not have an error for a proper URL")
 	assert.Equal(t, "host", cb.Host())
 	assert.Equal(t, 15002, cb.Port())
 	assert.Len(t, cb.Headers(), 1)
@@ -76,7 +78,7 @@ func TestBasicChannelParsing(t *testing.T) {
 func TestChannelBuildConnect(t *testing.T) {
 	ctx := context.Background()
 	cb, err := channel.NewBuilder("sc://localhost")
-	assert.Nil(t, err, "Should not have an error for a proper URL.")
+	assert.NoError(t, err, "Should not have an error for a proper URL.")
 	conn, err := cb.Build(ctx)
 	assert.Nil(t, err, "no error for proper connection")
 	assert.NotNil(t, conn)

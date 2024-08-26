@@ -1,3 +1,19 @@
+//
+// Licensed to the Apache Software Foundation (ASF) under one or more
+// contributor license agreements.  See the NOTICE file distributed with
+// this work for additional information regarding copyright ownership.
+// The ASF licenses this file to You under the Apache License, Version 2.0
+// (the "License"); you may not use this file except in compliance with
+// the License.  You may obtain a copy of the License at
+//
+//    http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package sql
 
 import (
@@ -19,12 +35,7 @@ type DataFrameWriter interface {
 	Save(ctx context.Context, path string) error
 }
 
-type SparkExecutor interface {
-	ExecutePlan(ctx context.Context, plan *proto.Plan) (*ExecutePlanClient, error)
-	AnalyzePlan(ctx context.Context, plan *proto.Plan) (*proto.AnalyzePlanResponse, error)
-}
-
-func newDataFrameWriter(sparkExecutor SparkExecutor, relation *proto.Relation) DataFrameWriter {
+func newDataFrameWriter(sparkExecutor *sparkSessionImpl, relation *proto.Relation) DataFrameWriter {
 	return &dataFrameWriterImpl{
 		sparkExecutor: sparkExecutor,
 		relation:      relation,
@@ -33,7 +44,7 @@ func newDataFrameWriter(sparkExecutor SparkExecutor, relation *proto.Relation) D
 
 // dataFrameWriterImpl is an implementation of DataFrameWriter interface.
 type dataFrameWriterImpl struct {
-	sparkExecutor SparkExecutor
+	sparkExecutor *sparkSessionImpl
 	relation      *proto.Relation
 	saveMode      string
 	formatSource  string
@@ -74,12 +85,13 @@ func (w *dataFrameWriterImpl) Save(ctx context.Context, path string) error {
 			},
 		},
 	}
-	responseClient, err := w.sparkExecutor.ExecutePlan(ctx, plan)
+	responseClient, err := w.sparkExecutor.client.ExecutePlan(ctx, plan)
 	if err != nil {
 		return err
 	}
 
-	return responseClient.consumeAll()
+	_, _, err = responseClient.ToTable()
+	return err
 }
 
 func getSaveMode(mode string) (proto.WriteOperation_SaveMode, error) {

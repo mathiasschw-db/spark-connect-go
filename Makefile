@@ -16,7 +16,7 @@
 #
 
 FIRST_GOPATH              := $(firstword $(subst :, ,$(GOPATH)))
-PKGS                      := $(shell go list ./... | grep -v /tests | grep -v /xcpb | grep -v /gpb)
+PKGS                      := $(shell go list ./... | grep -v /tests | grep -v /xcpb | grep -v /gpb | grep -v /generated)
 GOFILES_NOVENDOR          := $(shell find . -name vendor -prune -o -type f -name '*.go' -not -name '*.pb.go' -print)
 GOFILES_BUILD             := $(shell find . -type f -name '*.go' -not -name '*_test.go')
 PROTOFILES                := $(shell find . -name vendor -prune -o -type f -name '*.proto' -print)
@@ -30,11 +30,15 @@ TESTFLAGS                 ?=
 PWD                       := $(shell pwd)
 PREFIX                    ?= $(GOPATH)
 BINDIR                    ?= $(PREFIX)/bin
-GO                        := GO111MODULE=on go
+GO                        := go
 GOOS                      ?= $(shell go version | cut -d' ' -f4 | cut -d'/' -f1)
 GOARCH                    ?= $(shell go version | cut -d' ' -f4 | cut -d'/' -f2)
 TAGS                      ?= netgo
 SHELL = bash
+GOFUMPT_SPLIT_LONG_LINES  := on
+
+## Build tools
+BUF                       := $(GO) run github.com/bufbuild/buf/cmd/buf@v1.26.1
 
 BINARIES				  := cmd/spark-connect-example-spark-session cmd/spark-connect-example-raw-grpc-client
 
@@ -62,7 +66,7 @@ cmd/spark-connect-example-spark-session: $(GOFILES_BUILD)
 
 internal/generated.out:
 	@echo -n ">> BUILD, output = $@"
-	buf generate --debug -vvv
+	$(BUF) generate --debug -vvv
 	@touch internal/generated.out
 	@printf '%s\n' '$(OK)'
 
@@ -79,7 +83,8 @@ lint: $(BUILD_OUTPUT)
 	@golangci-lint run
 
 fmt:
-	@gofumpt -extra -w $(ALLGOFILES)
+	@echo -n ">> glongci-lint: fix"
+	env GOFUMPT_SPLIT_LONG_LINES=$(GOFUMPT_SPLIT_LONG_LINES) golangci-lint run --fix
 
 test: $(BUILD_OUTPUT)
 	@echo ">> TEST, \"verbose\""
@@ -87,15 +92,20 @@ test: $(BUILD_OUTPUT)
 	    @echo -n "     ";\
 		$(GO) test -v -run '(Test|Example)' $(BUILDFLAGS) $(TESTFLAGS) $(pkg) || exit 1)
 
-fulltest: $(BUILD_OUTPUT)
+coverage: $(BUILD_OUTPUT)
 	@echo ">> TEST, \"coverage\""
-	@echo "mode: atomic" > coverage-all.out
-	@$(foreach pkg, $(PKGS),\
-	    echo -n "     ";\
-		go test -run '(Test|Example)' $(BUILDFLAGS) $(TESTFLAGS) -coverprofile=coverage.out -covermode=atomic $(pkg) || exit 1;\
-		tail -n +2 coverage.out >> coverage-all.out;)
-	@$(GO) tool cover -html=coverage-all.out -o coverage-all.html
+	@$(GO) test -cover -coverprofile=coverage.out -covermode=atomic -coverpkg=./spark/...,./internal/tests/... ./spark/... ./internal/tests/...
+	@$(GO) tool cover -html=coverage.out -o coverage.html
 
+integration: $(BUILD_OUTPUT)
+	@echo ">> TEST, \"integration\""
+	@$(GO) test ./internal/tests/...
+
+check:
+	@echo -n ">> CHECK"
+	./dev/check-license
+	@echo -n ">> glongci-lint: "
+	env GOFUMPT_SPLIT_LONG_LINES=$(GOFUMPT_SPLIT_LONG_LINES) golangci-lint run
 
 clean:
 	@echo -n ">> CLEAN"

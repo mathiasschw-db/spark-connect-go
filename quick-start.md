@@ -5,7 +5,7 @@
 In your Go project `go.mod` file, add `spark-connect-go` library:
 ```
 require (
-	github.com/apache/spark-connect-go/v1 master
+	github.com/apache/spark-connect-go/v35 master
 )
 ```
 
@@ -14,20 +14,24 @@ In your Go project, run `go mod tidy` to download the library on your local mach
 ## Write Spark Connect Client Application
 
 Create `main.go` file with following code:
-```
+```go
 package main
 
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 
-	"github.com/apache/spark-connect-go/v35/client/sql"
+	"github.com/apache/spark-connect-go/v35/spark/sql"
 )
 
 var (
 	remote = flag.String("remote", "sc://localhost:15002",
 		"the remote address of Spark Connect server to connect to")
+
+	filedir = flag.String("filedir", "/tmp",
+		"the directory to save the files")
 )
 
 func main() {
@@ -79,13 +83,13 @@ func main() {
 
 	err = df.Writer().Mode("overwrite").
 		Format("parquet").
-		Save(ctx, "file:///tmp/spark-connect-write-example-output.parquet")
+		Save(ctx, fmt.Sprintf("file://%s/spark-connect-write-example-output.parquet", *filedir))
 	if err != nil {
 		log.Fatalf("Failed: %s", err)
 	}
 
 	df, err = spark.Read().Format("parquet").
-		Load("file:///tmp/spark-connect-write-example-output.parquet")
+		Load(fmt.Sprintf("file://%s/spark-connect-write-example-output.parquet", *filedir))
 	if err != nil {
 		log.Fatalf("Failed: %s", err)
 	}
@@ -107,20 +111,20 @@ func main() {
 	}
 
 	log.Printf("DataFrame from sql: select count, word from view1 order by count")
-	df.Show(100, false)
+	df.Show(ctx, 100, false)
 }
 ```
 
 ## Start Spark Connect Server (Driver)
 
-Download a Spark distribution (3.4.0+), unzip the folder, run command:
+Download a Spark distribution (3.5.0+), unzip the folder, run command:
 ```
-sbin/start-connect-server.sh --packages org.apache.spark:spark-connect_2.12:3.4.0
+sbin/start-connect-server.sh --packages org.apache.spark:spark-connect_2.12:3.5.2
 ```
 
 ## Run Spark Connect Client Application
 ```
-go run main.go
+go run main.go --filedir YOUR_TMP_DIR
 ```
 
 You will see the client application connects to the Spark Connect server and prints out the output from your application.

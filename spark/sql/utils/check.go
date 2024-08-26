@@ -14,17 +14,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-package sql
+package utils
 
-// StructField represents a field in a StructType.
-type StructField struct {
-	Name     string
-	DataType DataType
-	Nullable bool // default should be true
-}
-
-// StructType represents a struct type.
-type StructType struct {
-	TypeName string
-	Fields   []StructField
+func WarnOnError(f func() error, h func(e error)) {
+	if err := f(); err != nil {
+		h(err)
+	}
 }

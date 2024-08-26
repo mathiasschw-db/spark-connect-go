@@ -20,6 +20,7 @@ internal/generated.out
 
 # Ignore Coverage Files
 coverage*
+cov.report
 
 # Ignore IDE files
 .idea/
@@ -27,3 +28,8 @@ coverage*
 # Ignore binaries
 cmd/spark-connect-example-raw-grpc-client/spark-connect-example-raw-grpc-client
 cmd/spark-connect-example-spark-session/spark-connect-example-spark-session
+
+target
+lib
+
+deps

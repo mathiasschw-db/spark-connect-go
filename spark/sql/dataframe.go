@@ -17,15 +17,14 @@
 package sql
 
 import (
-	"bytes"
 	"context"
-	"errors"
 	"fmt"
-	"io"
 
-	"github.com/apache/arrow/go/v12/arrow"
-	"github.com/apache/arrow/go/v12/arrow/array"
-	"github.com/apache/arrow/go/v12/arrow/ipc"
+	"github.com/apache/spark-connect-go/v35/spark/sql/column"
+	"github.com/apache/spark-connect-go/v35/spark/sql/functions"
+
+	"github.com/apache/spark-connect-go/v35/spark/sql/types"
+
 	proto "github.com/apache/spark-connect-go/v35/internal/generated"
 	"github.com/apache/spark-connect-go/v35/spark/sparkerrors"
 )
@@ -43,7 +42,7 @@ type DataFrame interface {
 	// Show uses WriteResult to write the data frames to the console output.
 	Show(ctx context.Context, numRows int, truncate bool) error
 	// Schema returns the schema for the current data frame.
-	Schema(ctx context.Context) (*StructType, error)
+	Schema(ctx context.Context) (*types.StructType, error)
 	// Collect returns the data rows of the current data frame.
 	Collect(ctx context.Context) ([]Row, error)
 	// Writer returns a data frame writer, which could be used to save data frame to supported storage.
@@ -52,11 +51,26 @@ type DataFrame interface {
 	// Deprecated: Use Writer
 	Write() DataFrameWriter
 	// CreateTempView creates or replaces a temporary view.
-	CreateTempView(ctx context.Context, viewName string, replace bool, global bool) error
+	CreateTempView(ctx context.Context, viewName string, replace, global bool) error
 	// Repartition re-partitions a data frame.
 	Repartition(numPartitions int, columns []string) (DataFrame, error)
 	// RepartitionByRange re-partitions a data frame by range partition.
 	RepartitionByRange(numPartitions int, columns []RangePartitionColumn) (DataFrame, error)
+	// Filter filters the data frame by a column condition.
+	Filter(condition column.Column) (DataFrame, error)
+	// FilterByString filters the data frame by a string condition.
+	FilterByString(condition string) (DataFrame, error)
+	// Col returns a column by name.
+	Col(name string) (column.Column, error)
+
+	// Select projects a list of columns from the DataFrame
+	Select(columns ...column.Column) (DataFrame, error)
+	// SelectExpr projects a list of columns from the DataFrame by string expressions
+	SelectExpr(exprs ...string) (DataFrame, error)
+	// Alias creates a new DataFrame with the specified subquery alias
+	Alias(alias string) DataFrame
+	// CrossJoin joins the current DataFrame with another DataFrame using the cross product
+	CrossJoin(other DataFrame) DataFrame
 }
 
 type RangePartitionColumn struct {
@@ -66,20 +80,76 @@ type RangePartitionColumn struct {
 
 // dataFrameImpl is an implementation of DataFrame interface.
 type dataFrameImpl struct {
-	sparkExecutor SparkExecutor
-	relation      *proto.Relation // TODO change to proto.Plan?
+	session  *sparkSessionImpl
+	relation *proto.Relation // TODO change to proto.Plan?
+}
+
+func (df *dataFrameImpl) SelectExpr(exprs ...string) (DataFrame, error) {
+	expressions := make([]*proto.Expression, 0, len(exprs))
+	for _, expr := range exprs {
+		col := functions.Expr(expr)
+		f, e := col.ToPlan()
+		if e != nil {
+			return nil, e
+		}
+		expressions = append(expressions, f)
+	}
+
+	rel := &proto.Relation{
+		Common: &proto.RelationCommon{
+			PlanId: newPlanId(),
+		},
+		RelType: &proto.Relation_Project{
+			Project: &proto.Project{
+				Input:       df.relation,
+				Expressions: expressions,
+			},
+		},
+	}
+	return NewDataFrame(df.session, rel), nil
+}
+
+func (df *dataFrameImpl) Alias(alias string) DataFrame {
+	rel := &proto.Relation{
+		Common: &proto.RelationCommon{
+			PlanId: newPlanId(),
+		},
+		RelType: &proto.Relation_SubqueryAlias{
+			SubqueryAlias: &proto.SubqueryAlias{
+				Input: df.relation,
+				Alias: alias,
+			},
+		},
+	}
+	return NewDataFrame(df.session, rel)
+}
+
+func (df *dataFrameImpl) CrossJoin(other DataFrame) DataFrame {
+	otherDf := other.(*dataFrameImpl)
+	rel := &proto.Relation{
+		Common: &proto.RelationCommon{
+			PlanId: newPlanId(),
+		},
+		RelType: &proto.Relation_Join{
+			Join: &proto.Join{
+				Left:     df.relation,
+				Right:    otherDf.relation,
+				JoinType: proto.Join_JOIN_TYPE_CROSS,
+			},
+		},
+	}
+	return NewDataFrame(df.session, rel)
 }
 
 // NewDataFrame creates a new DataFrame
-func NewDataFrame(sparkExecutor SparkExecutor, relation *proto.Relation) DataFrame {
+func NewDataFrame(session *sparkSessionImpl, relation *proto.Relation) DataFrame {
 	return &dataFrameImpl{
-		sparkExecutor: sparkExecutor,
-		relation:      relation,
+		session:  session,
+		relation: relation,
 	}
 }
 
-type consoleCollector struct {
-}
+type consoleCollector struct{}
 
 func (c consoleCollector) WriteRow(values []any) {
 	fmt.Println(values...)
@@ -114,81 +184,73 @@ func (df *dataFrameImpl) WriteResult(ctx context.Context, collector ResultCollec
 		},
 	}
 
-	responseClient, err := df.sparkExecutor.ExecutePlan(ctx, plan)
+	responseClient, err := df.session.client.ExecutePlan(ctx, plan)
 	if err != nil {
 		return sparkerrors.WithType(fmt.Errorf("failed to show dataframe: %w", err), sparkerrors.ExecutionError)
 	}
 
-	for {
-		response, err := responseClient.Recv()
-		if err != nil {
-			return sparkerrors.WithType(fmt.Errorf("failed to receive show response: %w", err), sparkerrors.ReadError)
-		}
-		arrowBatch := response.GetArrowBatch()
-		if arrowBatch == nil {
-			continue
-		}
-		err = showArrowBatch(arrowBatch, collector)
-		if err != nil {
-			return err
-		}
-		return nil
+	schema, table, err := responseClient.ToTable()
+	if err != nil {
+		return err
 	}
+
+	rows := make([]Row, table.NumRows())
+
+	values, err := types.ReadArrowTable(table)
+	if err != nil {
+		return err
+	}
+
+	for idx, v := range values {
+		row := NewRowWithSchema(v, schema)
+		rows[idx] = row
+	}
+
+	for _, row := range rows {
+		values, err := row.Values()
+		if err != nil {
+			return sparkerrors.WithType(fmt.Errorf(
+				"failed to get values in the row: %w", err), sparkerrors.ReadError)
+		}
+		collector.WriteRow(values)
+	}
+	return nil
 }
 
-func (df *dataFrameImpl) Schema(ctx context.Context) (*StructType, error) {
-	response, err := df.sparkExecutor.AnalyzePlan(ctx, df.createPlan())
+func (df *dataFrameImpl) Schema(ctx context.Context) (*types.StructType, error) {
+	response, err := df.session.client.AnalyzePlan(ctx, df.createPlan())
 	if err != nil {
 		return nil, sparkerrors.WithType(fmt.Errorf("failed to analyze plan: %w", err), sparkerrors.ExecutionError)
 	}
 
 	responseSchema := response.GetSchema().Schema
-	return convertProtoDataTypeToStructType(responseSchema)
+	return types.ConvertProtoDataTypeToStructType(responseSchema)
 }
 
 func (df *dataFrameImpl) Collect(ctx context.Context) ([]Row, error) {
-	responseClient, err := df.sparkExecutor.ExecutePlan(ctx, df.createPlan())
+	responseClient, err := df.session.client.ExecutePlan(ctx, df.createPlan())
 	if err != nil {
 		return nil, sparkerrors.WithType(fmt.Errorf("failed to execute plan: %w", err), sparkerrors.ExecutionError)
 	}
 
-	var schema *StructType
-	var allRows []Row
-
-	for {
-		response, err := responseClient.Recv()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return allRows, nil
-			} else {
-				return nil, sparkerrors.WithType(fmt.Errorf("failed to receive plan execution response: %w", err), sparkerrors.ReadError)
-			}
-		}
-
-		dataType := response.GetSchema()
-		if dataType != nil {
-			schema, err = convertProtoDataTypeToStructType(dataType)
-			if err != nil {
-				return nil, err
-			}
-			continue
-		}
-
-		arrowBatch := response.GetArrowBatch()
-		if arrowBatch == nil {
-			continue
-		}
-
-		rowBatch, err := readArrowBatchData(arrowBatch.Data, schema)
-		if err != nil {
-			return nil, err
-		}
-
-		if allRows == nil {
-			allRows = make([]Row, 0, len(rowBatch))
-		}
-		allRows = append(allRows, rowBatch...)
+	var schema *types.StructType
+	schema, table, err := responseClient.ToTable()
+	if err != nil {
+		return nil, err
 	}
+
+	rows := make([]Row, table.NumRows())
+
+	values, err := types.ReadArrowTable(table)
+	if err != nil {
+		return nil, err
+	}
+
+	for idx, v := range values {
+		row := NewRowWithSchema(v, schema)
+		rows[idx] = row
+	}
+	return rows, nil
 }
 
 func (df *dataFrameImpl) Write() DataFrameWriter {
@@ -196,10 +258,10 @@ func (df *dataFrameImpl) Write() DataFrameWriter {
 }
 
 func (df *dataFrameImpl) Writer() DataFrameWriter {
-	return newDataFrameWriter(df.sparkExecutor, df.relation)
+	return newDataFrameWriter(df.session, df.relation)
 }
 
-func (df *dataFrameImpl) CreateTempView(ctx context.Context, viewName string, replace bool, global bool) error {
+func (df *dataFrameImpl) CreateTempView(ctx context.Context, viewName string, replace, global bool) error {
 	plan := &proto.Plan{
 		OpType: &proto.Plan_Command{
 			Command: &proto.Command{
@@ -215,12 +277,14 @@ func (df *dataFrameImpl) CreateTempView(ctx context.Context, viewName string, re
 		},
 	}
 
-	responseClient, err := df.sparkExecutor.ExecutePlan(ctx, plan)
+	responseClient, err := df.session.client.ExecutePlan(ctx, plan)
 	if err != nil {
-		return sparkerrors.WithType(fmt.Errorf("failed to create temp view %s: %w", viewName, err), sparkerrors.ExecutionError)
+		return sparkerrors.WithType(fmt.Errorf("failed to create temp view %s: %w",
+			viewName, err), sparkerrors.ExecutionError)
 	}
 
-	return responseClient.consumeAll()
+	_, _, err = responseClient.ToTable()
+	return err
 }
 
 func (df *dataFrameImpl) Repartition(numPartitions int, columns []string) (DataFrame, error) {
@@ -274,17 +338,14 @@ func (df *dataFrameImpl) RepartitionByRange(numPartitions int, columns []RangePa
 func (df *dataFrameImpl) createPlan() *proto.Plan {
 	return &proto.Plan{
 		OpType: &proto.Plan_Root{
-			Root: &proto.Relation{
-				Common: &proto.RelationCommon{
-					PlanId: newPlanId(),
-				},
-				RelType: df.relation.RelType,
-			},
+			Root: df.relation,
 		},
 	}
 }
 
-func (df *dataFrameImpl) repartitionByExpressions(numPartitions int, partitionExpressions []*proto.Expression) (DataFrame, error) {
+func (df *dataFrameImpl) repartitionByExpressions(numPartitions int,
+	partitionExpressions []*proto.Expression,
+) (DataFrame, error) {
 	var numPartitionsPointerValue *int32
 	if numPartitions != 0 {
 		int32Value := int32(numPartitions)
@@ -303,230 +364,58 @@ func (df *dataFrameImpl) repartitionByExpressions(numPartitions int, partitionEx
 			},
 		},
 	}
-	return NewDataFrame(df.sparkExecutor, newRelation), nil
+	return NewDataFrame(df.session, newRelation), nil
 }
 
-func showArrowBatch(arrowBatch *proto.ExecutePlanResponse_ArrowBatch, collector ResultCollector) error {
-	return showArrowBatchData(arrowBatch.Data, collector)
-}
-
-func showArrowBatchData(data []byte, collector ResultCollector) error {
-	rows, err := readArrowBatchData(data, nil)
+func (df *dataFrameImpl) Filter(condition column.Column) (DataFrame, error) {
+	cnd, err := condition.ToPlan()
 	if err != nil {
-		return err
+		return nil, err
 	}
-	for _, row := range rows {
-		values, err := row.Values()
-		if err != nil {
-			return sparkerrors.WithType(fmt.Errorf("failed to get values in the row: %w", err), sparkerrors.ReadError)
-		}
-		collector.WriteRow(values)
+
+	rel := &proto.Relation{
+		Common: &proto.RelationCommon{
+			PlanId: newPlanId(),
+		},
+		RelType: &proto.Relation_Filter{
+			Filter: &proto.Filter{
+				Input:     df.relation,
+				Condition: cnd,
+			},
+		},
 	}
-	return nil
+	return NewDataFrame(df.session, rel), nil
 }
 
-func readArrowBatchData(data []byte, schema *StructType) ([]Row, error) {
-	reader := bytes.NewReader(data)
-	arrowReader, err := ipc.NewReader(reader)
-	if err != nil {
-		return nil, sparkerrors.WithType(fmt.Errorf("failed to create arrow reader: %w", err), sparkerrors.ReadError)
-	}
-	defer arrowReader.Release()
+func (df *dataFrameImpl) FilterByString(condition string) (DataFrame, error) {
+	return df.Filter(functions.Expr(condition))
+}
 
-	var rows []Row
+func (df *dataFrameImpl) Col(name string) (column.Column, error) {
+	planId := df.relation.Common.GetPlanId()
+	return column.NewColumn(column.NewColumnReferenceWithPlanId(name, planId)), nil
+}
 
-	for {
-		record, err := arrowReader.Read()
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				return rows, nil
-			} else {
-				return nil, sparkerrors.WithType(fmt.Errorf("failed to read arrow: %w", err), sparkerrors.ReadError)
-			}
-		}
-
-		values, err := readArrowRecord(record)
+func (df *dataFrameImpl) Select(columns ...column.Column) (DataFrame, error) {
+	exprs := make([]*proto.Expression, 0, len(columns))
+	for _, c := range columns {
+		expr, err := c.ToPlan()
 		if err != nil {
 			return nil, err
 		}
-
-		numRows := int(record.NumRows())
-		if rows == nil {
-			rows = make([]Row, 0, numRows)
-		}
-
-		for _, v := range values {
-			row := NewRowWithSchema(v, schema)
-			rows = append(rows, row)
-		}
-
-		hasNext := arrowReader.Next()
-		if !hasNext {
-			break
-		}
+		exprs = append(exprs, expr)
 	}
 
-	return rows, nil
-}
-
-// readArrowRecordColumn reads all values from arrow record and return [][]any
-func readArrowRecord(record arrow.Record) ([][]any, error) {
-	numRows := record.NumRows()
-	numColumns := int(record.NumCols())
-
-	values := make([][]any, numRows)
-	for i := range values {
-		values[i] = make([]any, numColumns)
+	rel := &proto.Relation{
+		Common: &proto.RelationCommon{
+			PlanId: newPlanId(),
+		},
+		RelType: &proto.Relation_Project{
+			Project: &proto.Project{
+				Input:       df.relation,
+				Expressions: exprs,
+			},
+		},
 	}
-
-	for columnIndex := 0; columnIndex < numColumns; columnIndex++ {
-		err := readArrowRecordColumn(record, columnIndex, values)
-		if err != nil {
-			return nil, err
-		}
-	}
-	return values, nil
-}
-
-// readArrowRecordColumn reads all values in a column and stores them in values
-func readArrowRecordColumn(record arrow.Record, columnIndex int, values [][]any) error {
-	numRows := int(record.NumRows())
-	columnData := record.Column(columnIndex).Data()
-	dataTypeId := columnData.DataType().ID()
-	switch dataTypeId {
-	case arrow.BOOL:
-		vector := array.NewBooleanData(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.INT8:
-		vector := array.NewInt8Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.INT16:
-		vector := array.NewInt16Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.INT32:
-		vector := array.NewInt32Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.INT64:
-		vector := array.NewInt64Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.FLOAT16:
-		vector := array.NewFloat16Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.FLOAT32:
-		vector := array.NewFloat32Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.FLOAT64:
-		vector := array.NewFloat64Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.DECIMAL | arrow.DECIMAL128:
-		vector := array.NewDecimal128Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.DECIMAL256:
-		vector := array.NewDecimal256Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.STRING:
-		vector := array.NewStringData(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.BINARY:
-		vector := array.NewBinaryData(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.TIMESTAMP:
-		vector := array.NewTimestampData(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	case arrow.DATE64:
-		vector := array.NewDate64Data(columnData)
-		for rowIndex := 0; rowIndex < numRows; rowIndex++ {
-			values[rowIndex][columnIndex] = vector.Value(rowIndex)
-		}
-	default:
-		return fmt.Errorf("unsupported arrow data type %s in column %d", dataTypeId.String(), columnIndex)
-	}
-	return nil
-}
-
-func convertProtoDataTypeToStructType(input *proto.DataType) (*StructType, error) {
-	dataTypeStruct := input.GetStruct()
-	if dataTypeStruct == nil {
-		return nil, sparkerrors.WithType(errors.New("dataType.GetStruct() is nil"), sparkerrors.InvalidInputError)
-	}
-	return &StructType{
-		Fields: convertProtoStructFields(dataTypeStruct.Fields),
-	}, nil
-}
-
-func convertProtoStructFields(input []*proto.DataType_StructField) []StructField {
-	result := make([]StructField, len(input))
-	for i, f := range input {
-		result[i] = convertProtoStructField(f)
-	}
-	return result
-}
-
-func convertProtoStructField(field *proto.DataType_StructField) StructField {
-	return StructField{
-		Name:     field.Name,
-		DataType: convertProtoDataTypeToDataType(field.DataType),
-	}
-}
-
-// convertProtoDataTypeToDataType converts protobuf data type to Spark connect sql data type
-func convertProtoDataTypeToDataType(input *proto.DataType) DataType {
-	switch v := input.GetKind().(type) {
-	case *proto.DataType_Boolean_:
-		return BooleanType{}
-	case *proto.DataType_Byte_:
-		return ByteType{}
-	case *proto.DataType_Short_:
-		return ShortType{}
-	case *proto.DataType_Integer_:
-		return IntegerType{}
-	case *proto.DataType_Long_:
-		return LongType{}
-	case *proto.DataType_Float_:
-		return FloatType{}
-	case *proto.DataType_Double_:
-		return DoubleType{}
-	case *proto.DataType_Decimal_:
-		return DecimalType{}
-	case *proto.DataType_String_:
-		return StringType{}
-	case *proto.DataType_Binary_:
-		return BinaryType{}
-	case *proto.DataType_Timestamp_:
-		return TimestampType{}
-	case *proto.DataType_TimestampNtz:
-		return TimestampNtzType{}
-	case *proto.DataType_Date_:
-		return DateType{}
-	default:
-		return UnsupportedType{
-			TypeInfo: v,
-		}
-	}
+	return NewDataFrame(df.session, rel), nil
 }
